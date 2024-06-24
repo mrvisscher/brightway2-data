@@ -31,7 +31,7 @@ from ..search import IndexManager, Searcher
 from ..utils import as_uncertainty_dict, get_geocollection, get_node
 from . import sqlite3_lci_db
 from .proxies import Activity
-from .schema import ActivityDataset, ExchangeDataset, get_id
+from .schema import ActivityDataset, ExchangeDataset, ProductDataset, get_id
 from .typos import (
     check_activity_keys,
     check_activity_type,
@@ -42,6 +42,7 @@ from .utils import (
     check_exchange,
     dict_as_activitydataset,
     dict_as_exchangedataset,
+    dict_as_productdataset,
     get_csv_data_dict,
     retupleize_geo_strings,
 )
@@ -429,9 +430,11 @@ class SQLiteBackend(ProcessedDataStore):
         ds: dict,
         exchanges: list,
         activities: list,
+        products: list,
         check_typos: bool = True,
-    ) -> (list, list):
-        for exchange in ds.get("exchanges", []):
+    ) -> (list, list, list):
+
+        def parse_exchange(exchange: dict, out_key):
             if "input" not in exchange or "amount" not in exchange:
                 raise InvalidExchange
             if "type" not in exchange:
@@ -441,7 +444,7 @@ class SQLiteBackend(ProcessedDataStore):
                 check_exchange_type(exchange.get("type"))
                 check_exchange_keys(exchange)
 
-            exchange["output"] = key
+            exchange["output"] = out_key
             exchanges.append(dict_as_exchangedataset(exchange))
 
             # Query gets passed as INSERT INTO x VALUES ('?', '?'...)
@@ -451,9 +454,24 @@ class SQLiteBackend(ProcessedDataStore):
             # peewee.OperationalError: too many SQL variables
             if len(exchanges) > 125:
                 ExchangeDataset.insert_many(exchanges).execute()
-                exchanges = []
+                exchanges.clear()
 
-        ds = {k: v for k, v in ds.items() if k != "exchanges"}
+        def parse_product(product: dict):
+            for exc in product.get("exchanges", []):
+                parse_exchange(exc, (key[0], product["code"]))
+            product["database"] = key[0]
+            product["source_code"] = key[1]
+            product["alloc_total"] = alloc_total
+            products.append(dict_as_productdataset(product))
+
+        for exc in ds.get("exchanges", []):
+            parse_exchange(exc, key)
+
+        alloc_total = sum([x.get("allocation", 1) for x in ds.get("products", [])])
+        for prod in ds.get("products", []):
+            parse_product(prod)
+
+        ds = {k: v for k, v in ds.items() if k != "exchanges" and k != "products"}
         ds["database"] = key[0]
         ds["code"] = key[1]
 
@@ -467,7 +485,7 @@ class SQLiteBackend(ProcessedDataStore):
             ActivityDataset.insert_many(activities).execute()
             activities = []
 
-        return exchanges, activities
+        return exchanges, activities, products
 
     def _efficient_write_many_data(
         self, data: dict, indices: bool = True, check_typos: bool = True
@@ -479,19 +497,21 @@ class SQLiteBackend(ProcessedDataStore):
         try:
             sqlite3_lci_db.db.begin()
             self.delete(keep_params=True, warn=False, vacuum=False)
-            exchanges, activities = [], []
+            exchanges, activities, products = [], [], []
 
             for key, ds in tqdm_wrapper(
                 data.items(), getattr(config, "is_test", False)
             ):
-                exchanges, activities = self._efficient_write_dataset(
-                    key, ds, exchanges, activities, check_typos
+                exchanges, activities, products = self._efficient_write_dataset(
+                    key, ds, exchanges, activities, products, check_typos
                 )
 
             if activities:
                 ActivityDataset.insert_many(activities).execute()
             if exchanges:
                 ExchangeDataset.insert_many(exchanges).execute()
+            if products:
+                ProductDataset.insert_many(products).execute()
             sqlite3_lci_db.db.commit()
             sqlite3_lci_db.vacuum()
         except:
@@ -708,6 +728,7 @@ Here are the type values usually used for nodes:
                 input_code,
                 output_database,
                 output_code,
+                allocation,
             ) = line
             # Modify ``dependents`` in place
             if input_database != output_database:
@@ -724,6 +745,9 @@ Here are the type values usually used for nodes:
                         (input_database, input_code), (output_database, output_code)
                     )
                 )
+            data = as_uncertainty_dict(data)
+            data["amount"] = data["amount"] * allocation
+            
             yield {
                 **as_uncertainty_dict(data),
                 "row": row,
@@ -788,24 +812,45 @@ Here are the type values usually used for nodes:
         )
         self._add_inventory_geomapping_to_datapackage(dp)
 
-        BIOSPHERE_SQL = """SELECT e.data, a.id, b.id, e.input_database, e.input_code, e.output_database, e.output_code
+        BIOSPHERE_SQL = """SELECT e.data, a.id, b.id, e.input_database, e.input_code, e.output_database, e.output_code, 1
                 FROM exchangedataset as e
                 LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
                 LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
                 WHERE e.output_database = ?
                 AND e.type = 'biosphere'
         """
+
+        BIOSPHERE_SQL_2 = """
+                SELECT 
+                    e.data,
+                    CASE WHEN p.matrix_id IS NULL THEN a.matrix_id ELSE p.matrix_id END AS row,
+                    CASE WHEN q.matrix_id IS NULL THEN b.matrix_id ELSE q.matrix_id END as col,
+                    e.input_database, 
+                    e.input_code, 
+                    e.output_database, 
+                    e.output_code,
+                    CASE WHEN q.allocation / q.alloc_total IS NULL THEN 1 ELSE q.allocation / q.alloc_total END AS allocation            
+                FROM exchangedataset as e
+                LEFT JOIN productdataset as p ON p.code == e.input_code AND p.database == e.input_database
+                LEFT JOIN productdataset as q ON q.source_code == e.output_code AND q.database == e.output_database
+                LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
+                LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
+                WHERE 
+                    e.output_database = ?
+                    AND e.type = 'biosphere'
+                """
+
         dp.add_persistent_vector_from_iterator(
             matrix="biosphere_matrix",
             name=clean_datapackage_name(self.name + " biosphere matrix"),
-            dict_iterator=self.exchange_data_iterator(BIOSPHERE_SQL, dependents),
+            dict_iterator=self.exchange_data_iterator(BIOSPHERE_SQL_2, dependents),
         )
 
         # Figure out when the production exchanges are implicit
-        implicit_production = (
-            {"row": get_id((self.name, x[0])), "amount": 1}
+        implicit_activity_production = (
+            {"row": x.matrix_id, "amount": 1}
             # Get all codes
-            for x in ActivityDataset.select(ActivityDataset.code)
+            for x in ActivityDataset.select(ActivityDataset.matrix_id)
             .where(
                 # Get correct database name
                 ActivityDataset.database == self.name,
@@ -823,22 +868,66 @@ Here are the type values usually used for nodes:
                     )
                 ),
             )
-            .tuples()
         )
 
-        TECHNOSPHERE_POSITIVE_SQL = """SELECT e.data, a.id, b.id, e.input_database, e.input_code, e.output_database, e.output_code
-                FROM exchangedataset as e
-                LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
-                LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
-                WHERE e.output_database = ?
-                AND e.type IN ('production', 'substitution', 'generic production')
+        implicit_product_production = (
+            {"row": x.matrix_id, "amount": 1}
+            # Get all codes
+            for x in ProductDataset.select(ProductDataset.matrix_id)
+            .where(
+                # Get correct database name
+                ProductDataset.database == self.name,
+                # But exclude activities that already have production exchanges
+                ~(
+                    ProductDataset.code
+                    << ExchangeDataset.select(
+                        # Get codes to exclude
+                        ExchangeDataset.output_code
+                    ).where(
+                        ExchangeDataset.output_database == self.name,
+                        ExchangeDataset.type << labels.technosphere_positive_edge_types,
+                    )
+                ),
+            )
+        )
+
+        TECHNOSPHERE_POSITIVE_SQL = """
+        SELECT 
+            e.data,
+            CASE WHEN p.matrix_id IS NULL THEN a.matrix_id ELSE p.matrix_id END AS row,
+            CASE WHEN q.matrix_id IS NULL THEN b.matrix_id ELSE q.matrix_id END as col,
+            e.input_database, 
+            e.input_code, 
+            e.output_database, 
+            e.output_code,
+            1 AS allocation            
+        FROM exchangedataset as e
+        LEFT JOIN productdataset as p ON p.code == e.input_code AND p.database == e.input_database
+        LEFT JOIN productdataset as q ON q.code == e.output_code AND q.database == e.output_database
+        LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
+        LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
+        WHERE 
+            e.output_database = ?
+            AND e.type IN ('production', 'substitution', 'generic production')
         """
-        TECHNOSPHERE_NEGATIVE_SQL = """SELECT e.data, a.id, b.id, e.input_database, e.input_code, e.output_database, e.output_code
-                FROM exchangedataset as e
-                LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
-                LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
-                WHERE e.output_database = ?
-                AND e.type IN ('technosphere', 'generic consumption')
+        TECHNOSPHERE_NEGATIVE_SQL = """
+           SELECT 
+                e.data,
+                CASE WHEN p.matrix_id IS NULL THEN a.matrix_id ELSE p.matrix_id END AS row,
+                CASE WHEN q.matrix_id IS NULL THEN b.matrix_id ELSE q.matrix_id END as col,
+                e.input_database, 
+                e.input_code, 
+                e.output_database, 
+                e.output_code,
+                CASE WHEN q.allocation / q.alloc_total IS NULL THEN 1 ELSE q.allocation / q.alloc_total END AS allocation            
+            FROM exchangedataset as e
+            LEFT JOIN productdataset as p ON p.code == e.input_code AND p.database == e.input_database
+            LEFT JOIN productdataset as q ON q.source_code == e.output_code AND q.database == e.output_database
+            LEFT JOIN activitydataset as a ON a.code == e.input_code AND a.database == e.input_database
+            LEFT JOIN activitydataset as b ON b.code == e.output_code AND b.database == e.output_database
+            WHERE 
+                e.output_database = ?
+                AND e.type IN ("technosphere", "generic consumption")
         """
 
         dp.add_persistent_vector_from_iterator(
@@ -849,7 +938,8 @@ Here are the type values usually used for nodes:
                     TECHNOSPHERE_NEGATIVE_SQL, dependents, flip=True
                 ),
                 self.exchange_data_iterator(TECHNOSPHERE_POSITIVE_SQL, dependents),
-                implicit_production,
+                implicit_activity_production,
+                implicit_product_production,
             ),
         )
         if csv:

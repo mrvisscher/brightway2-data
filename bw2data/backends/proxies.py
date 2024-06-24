@@ -8,17 +8,17 @@ import pandas as pd
 from .. import databases, geomapping
 from ..configuration import labels
 from ..errors import ValidityError
-from ..proxies import ActivityProxyBase, ExchangeProxyBase
+from ..proxies import ActivityProxyBase, ExchangeProxyBase, ProductProxyBase
 from ..search import IndexManager
 from . import sqlite3_lci_db
-from .schema import ActivityDataset, ExchangeDataset
+from .schema import ActivityDataset, ExchangeDataset, ProductDataset
 from .typos import (
     check_activity_keys,
     check_activity_type,
     check_exchange_keys,
     check_exchange_type,
 )
-from .utils import dict_as_activitydataset, dict_as_exchangedataset
+from .utils import dict_as_activitydataset, dict_as_exchangedataset, dict_as_productdataset
 
 
 class Exchanges(Iterable):
@@ -488,6 +488,123 @@ class Activity(ActivityProxyBase):
                 data["input"] = activity.key
             ExchangeDataset.create(**dict_as_exchangedataset(data))
         return activity
+
+
+class Product(ProductProxyBase):
+    def __init__(self, document=None, **kwargs):
+        """Create a `Product` proxy object.
+
+        If this is a new product, can pass `kwargs`.
+
+        If the product exists in the database, `document` should be an `ProductDataset`.
+        """
+        if document is None:
+            self._document = ProductDataset()
+            self._data = kwargs
+        else:
+            self._document = document
+            self._data = self._document.data
+            self._data["code"] = self._document.code
+            self._data["source_code"] = self._document.source_code
+            self._data["database"] = self._document.database
+            self._data["id"] = self._document.id
+
+    @property
+    def id(self):
+        return self._document.id
+
+    @property
+    def key(self):
+        return (self.get("database"), self.get("code"))
+
+    def __getitem__(self, key):
+        if key == 0:
+            return self["database"]
+        elif key == 1:
+            return self["code"]
+        elif key in self._data:
+            return self._data[key]
+
+        raise KeyError
+
+    def __setitem__(self, key, value):
+        if key == "id":
+            raise ValueError("`id` is read-only")
+        elif key == "code" and "code" in self._data:
+            raise NotImplementedError
+            # self._change_code(value)
+            # print(
+            #     "Successfully switched activity dataset to new code `{}`".format(value)
+            # )
+        elif key == "database" and "database" in self._data:
+            raise NotImplementedError
+            # self._change_database(value)
+            # print("Successfully switch activity dataset to database `{}`".format(value))
+        else:
+            super().__setitem__(key, value)
+
+    def delete(self):
+        self.exchanges().delete()
+        self._document.delete_instance()
+        self = None
+
+    def save(self):
+        """
+        Saves the current activity to the database after performing various checks.
+        This method validates the activity, updates the database status, and handles
+        geographical and indexing updates. It raises an error if the activity is
+        not valid and updates relevant data in the database.
+
+        Raises
+        ------
+        ValidityError
+            If the activity is not valid, an error is raised detailing the reasons.
+
+        Notes
+        -----
+        The method performs the following operations:
+        - Checks if the activity is valid.
+        - Marks the database as 'dirty', indicating changes.
+        - Checks for type and key validity of the activity.
+        - Updates the activity's associated document in the database.
+        - Updates the geographical mapping if needed.
+        - Updates the index if the database is searchable.
+
+        Examples
+        -------
+        >>> product.save()
+        Saves the activity if it's valid, otherwise raises ValidityError.
+        """
+        if not self.valid():
+            raise ValidityError(
+                "This activity can't be saved for the "
+                + "following reasons\n\t* "
+                + "\n\t* ".join(self.valid(why=True)[1])
+            )
+
+        databases.set_dirty(self["database"])
+
+        # check_activity_type(self._data.get("type"))
+        # check_activity_keys(self)
+
+        for key, value in dict_as_productdataset(self._data).items():
+            if key != "id":
+                setattr(self._document, key, value)
+        self._document.save()
+
+        q = ProductDataset.select(ProductDataset.allocation).where(
+            (ProductDataset.database == self["database"]) &
+            (ProductDataset.source_code == self["source_code"]))
+
+        ProductDataset.update(alloc_total=sum([x.allocation for x in q])).where(
+            (ProductDataset.database == self["database"]) &
+            (ProductDataset.source_code == self["source_code"])).execute()
+
+        # if databases[self["database"]].get("searchable", True):
+        #     IndexManager(Database(self["database"]).filename).update_dataset(self._data)
+
+    def exchanges(self):
+        return Exchanges(self.key)
 
 
 class Exchange(ExchangeProxyBase):

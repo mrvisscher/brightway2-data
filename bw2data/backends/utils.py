@@ -73,6 +73,19 @@ def dict_as_activitydataset(ds):
     }
 
 
+def dict_as_productdataset(ds):
+    return {
+        "data": ds,
+        "database": ds["database"],
+        "code": ds["code"],
+        "source_code": ds["source_code"],
+        "name": ds.get("name"),
+        "allocation": ds.get("allocation", 1),
+        "alloc_total": ds.get("alloc_total", 1),
+        "type": ds.get("type", "product"),
+    }
+
+
 def dict_as_exchangedataset(ds):
     return {
         "data": ds,

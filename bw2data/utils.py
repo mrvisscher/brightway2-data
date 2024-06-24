@@ -429,6 +429,28 @@ def get_activity(key=None, **kwargs):
     return get_node(**kwargs)
 
 
+def get_product(key=None, **kwargs):
+    """Support multiple ways to get exactly one activity node.
+
+    ``key`` can be an integer or a key tuple."""
+    from .backends import Product, ProductDataset
+
+    # Includes subclasses
+    if isinstance(key, Product):
+        return key
+    elif isinstance(key, tuple):
+        try:
+            pd = ProductDataset.get((ProductDataset.database == key[0]) & (ProductDataset.code == key[1]))
+        except ProductDataset.DoesNotExist:
+            return get_activity(key)
+        return Product(pd)
+    elif isinstance(key, numbers.Integral):
+        pd = ProductDataset.get_by_id(key)
+        return Product(pd)
+    else:
+        return get_activity(key)
+
+
 def get_geocollection(location, default_global_location=False):
     """conservative approach to finding geocollections. Won't guess about ecoinvent or other databases."""
     if not location:

@@ -5,7 +5,7 @@ from stats_arrays import uncertainty_choices
 
 from . import databases
 from .errors import InvalidExchange
-from .utils import get_activity
+from .utils import get_activity, get_product
 
 
 class ProxyBase(MutableMapping):
@@ -114,6 +114,58 @@ class ActivityProxyBase(ProxyBase):
         return lca
 
 
+class ProductProxyBase(ProxyBase):
+    def __str__(self):
+        if self.valid():
+            return "'{}' ({}, {}, {})".format(
+                self.get("name"),
+                self.get("unit"),
+                self.get("location"),
+                self.get("categories"),
+            )
+        else:
+            return "Activity with missing fields (call ``valid(why=True)`` to see more)"
+
+    @property
+    def key(self):
+        return (self.get("database"), self.get("code"))
+
+    def __eq__(self, other):
+        return self.key == other
+
+    def __lt__(self, other):
+        if not isinstance(other, ActivityProxyBase):
+            raise TypeError
+        else:
+            return self.key < other.key
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def valid(self, why=False):
+        errors = []
+        if not self.get("database"):
+            errors.append("Missing field ``database``")
+        elif self.get("database") not in databases:
+            errors.append("``database`` refers to unknown database")
+        if not self.get("code"):
+            errors.append("Missing field ``code``")
+        if not self.get("source_code"):
+            errors.append("Missing field ``source_code``")
+        if not self.get("name"):
+            errors.append("Missing field ``name``")
+        if errors:
+            if why:
+                return (False, errors)
+            else:
+                return False
+        else:
+            return True
+
+
 class ExchangeProxyBase(ProxyBase):
     def __str__(self):
         if self.valid():
@@ -148,7 +200,7 @@ class ExchangeProxyBase(ProxyBase):
         if not self.get("input"):
             raise InvalidExchange("Missing valid data for `input` field")
         elif not hasattr(self, "_input"):
-            self._input = get_activity(self["input"])
+            self._input = get_product(self["input"])
         return self._input
 
     def _set_input(self, value):
